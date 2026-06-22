@@ -35,8 +35,37 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { SpreadsheetRow, ScreenshotFile, DashboardStats } from './types';
 import { drawMockScreenshot } from './screenshotGenerator';
+import { INITIAL_SPREADSHEET_DATA } from './data';
 
 export default function App() {
+  // Base URL untuk API (berguna saat frontend di Vercel tapi backend di host lain).
+  // Di Vercel, Anda bisa set Environment Variable: VITE_API_BASE_URL=https://backend-anda.com
+  const API_BASE = (import.meta as any).env?.VITE_API_BASE_URL
+    ? String((import.meta as any).env.VITE_API_BASE_URL).replace(/\/+$/, '')
+    : '';
+  const apiUrl = (p: string) => (API_BASE ? `${API_BASE}${p}` : p);
+  const apiFetch = (p: string, init?: RequestInit) => fetch(apiUrl(p), init);
+
+  const loadLocalRowsFallback = (): SpreadsheetRow[] => {
+    try {
+      const raw = localStorage.getItem('local_spreadsheet_rows');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length >= 0) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return INITIAL_SPREADSHEET_DATA;
+  };
+
+  const saveLocalRowsFallback = (nextRows: SpreadsheetRow[]) => {
+    try {
+      localStorage.setItem('local_spreadsheet_rows', JSON.stringify(nextRows));
+    } catch {
+      // ignore
+    }
+  };
   // Navigation
   const [activeTab, setActiveTab] = useState<'spreadsheet' | 'studio' | 'passwords' | 'cloud-gallery'>('spreadsheet');
 
@@ -187,16 +216,22 @@ export default function App() {
   const fetchSpreadsheetData = async () => {
     try {
       setLoading(true);
-      const res = await fetch('/api/spreadsheet');
+      const res = await apiFetch('/api/spreadsheet');
       if (res.ok) {
         const data = await res.json();
         setRows(data);
+        saveLocalRowsFallback(data);
       } else {
-        showToast('Gagal memuat data spreadsheet', 'error');
+        // Fallback untuk hosting tanpa backend (mis. Vercel static)
+        const fallback = loadLocalRowsFallback();
+        setRows(fallback);
+        showToast('Gagal memuat dari server, memakai data lokal cadangan', 'info');
       }
     } catch (err) {
       console.error(err);
-      showToast('Gagal terhubung dengan server backend', 'error');
+      const fallback = loadLocalRowsFallback();
+      setRows(fallback);
+      showToast('Gagal terhubung server, memakai data lokal cadangan', 'info');
     } finally {
       setLoading(false);
     }
@@ -206,7 +241,7 @@ export default function App() {
   const fetchScreenshots = async () => {
     try {
       setGalleryLoading(true);
-      const res = await fetch('/api/screenshots');
+      const res = await apiFetch('/api/screenshots');
       if (res.ok) {
         const data = await res.json();
         setScreenshots(data);
@@ -229,19 +264,32 @@ export default function App() {
       setSheetSyncing(true);
       showToast('Menghubungkan & mengambil data dari Google Sheets...', 'info');
       
-      const res = await fetch('/api/sheets-sync/pull', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ webAppUrl: targetUrl }),
-      });
+      // 1) Coba lewat backend (jika ada)
+      let res: Response | null = null;
+      try {
+        res = await apiFetch('/api/sheets-sync/pull', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ webAppUrl: targetUrl }),
+        });
+      } catch {
+        res = null;
+      }
+
+      // 2) Fallback langsung ke Google Web App (untuk Vercel static tanpa backend)
+      if (!res) {
+        res = await fetch(targetUrl);
+      }
 
       if (res.ok) {
         const payload = await res.json();
-        setRows(payload.data);
+        const nextRows = Array.isArray(payload?.data) ? payload.data : payload;
+        setRows(nextRows);
+        saveLocalRowsFallback(nextRows);
         const nowStr = new Date().toLocaleString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit', day: '2-digit', month: 'short' });
         setLastSyncTime(nowStr);
         localStorage.setItem('last_sheet_sync_time', nowStr);
-        showToast(`Koneksi Sukses! Berhasil menarik ${payload.count} kategori baris dari Google Sheets`, 'success');
+        showToast(`Koneksi Sukses! Berhasil menarik ${Array.isArray(nextRows) ? nextRows.length : 0} kategori baris dari Google Sheets`, 'success');
       } else {
         const errPayload = await res.json();
         showToast(errPayload.error || 'Gagal menarik data dari Google Sheets. Pastikan akses di-set "Anyone"', 'error');
@@ -264,14 +312,30 @@ export default function App() {
       setSheetSyncing(true);
       showToast('Mengirim & mengekspor data ke Google Sheets...', 'info');
 
-      const res = await fetch('/api/sheets-sync/push', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ webAppUrl: googleSheetUrl }),
-      });
+      // 1) Coba lewat backend (jika ada)
+      let res: Response | null = null;
+      try {
+        res = await apiFetch('/api/sheets-sync/push', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ webAppUrl: googleSheetUrl }),
+        });
+      } catch {
+        res = null;
+      }
+
+      // 2) Fallback langsung ke Google Web App (untuk Vercel static tanpa backend)
+      if (!res) {
+        const payload = { spreadsheet: rows, screenshots };
+        res = await fetch(googleSheetUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+      }
 
       if (res.ok) {
-        const payload = await res.json();
+        await res.json().catch(() => ({} as any));
         const nowStr = new Date().toLocaleString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit', day: '2-digit', month: 'short' });
         setLastSyncTime(nowStr);
         localStorage.setItem('last_sheet_sync_time', nowStr);
@@ -292,11 +356,27 @@ export default function App() {
   const triggerAutoSilentPush = async () => {
     if (!autoSyncToSheets || !googleSheetUrl) return;
     try {
-      const res = await fetch('/api/sheets-sync/push', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ webAppUrl: googleSheetUrl }),
-      });
+      // 1) Coba lewat backend (jika ada)
+      let res: Response | null = null;
+      try {
+        res = await apiFetch('/api/sheets-sync/push', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ webAppUrl: googleSheetUrl }),
+        });
+      } catch {
+        res = null;
+      }
+
+      // 2) Fallback langsung ke Google Web App (untuk Vercel static tanpa backend)
+      if (!res) {
+        const payload = { spreadsheet: rows, screenshots };
+        res = await fetch(googleSheetUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+      }
       if (res.ok) {
         const nowStr = new Date().toLocaleString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit', day: '2-digit', month: 'short' });
         setLastSyncTime(nowStr);
@@ -349,10 +429,11 @@ export default function App() {
     updatedRows[index] = updatedRow;
 
     setRows(updatedRows);
+    saveLocalRowsFallback(updatedRows);
     setEditingCell(null);
 
     try {
-      const res = await fetch('/api/spreadsheet', {
+      const res = await apiFetch('/api/spreadsheet', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updatedRow),
@@ -363,13 +444,14 @@ export default function App() {
         showToast('Gagal menyimpan perubahan ke server', 'error');
         updatedRows[index] = previousRow;
         setRows(updatedRows);
+        saveLocalRowsFallback(updatedRows);
       } else {
         showToast(`Sel ${String(field).toUpperCase()} berhasil diperbarui`);
         triggerAutoSilentPush();
       }
     } catch (err) {
       console.error(err);
-      showToast('Koneksi server gagal, perubahan disimpan lokal saja', 'info');
+      showToast('Backend tidak tersedia, perubahan disimpan lokal saja', 'info');
     }
   };
 
@@ -381,10 +463,11 @@ export default function App() {
       async () => {
         try {
           setLoading(true);
-          const res = await fetch('/api/spreadsheet/reset', { method: 'POST' });
+          const res = await apiFetch('/api/spreadsheet/reset', { method: 'POST' });
           if (res.ok) {
             const payload = await res.json();
             setRows(payload.data);
+            saveLocalRowsFallback(payload.data);
             setSelectedRowIds(new Set());
             showToast('Spreadsheet berhasil diatur ulang ke links default!', 'success');
             // Setelah reset, langsung sinkronkan ke Google Sheets agar kategori ter-update otomatis
@@ -394,7 +477,13 @@ export default function App() {
           }
         } catch (err) {
           console.error(err);
-          showToast('Koneksi database gagal', 'error');
+          // Fallback tanpa backend: reset lokal + push ke sheets
+          const fallback = INITIAL_SPREADSHEET_DATA;
+          setRows(fallback);
+          saveLocalRowsFallback(fallback);
+          setSelectedRowIds(new Set());
+          showToast('Backend tidak tersedia, reset dilakukan lokal', 'info');
+          setTimeout(() => triggerAutoSilentPush(), 600);
         } finally {
           setLoading(false);
         }
@@ -421,9 +510,10 @@ export default function App() {
 
     const updatedRows = [...rows, newRow];
     setRows(updatedRows);
+    saveLocalRowsFallback(updatedRows);
 
     try {
-      const res = await fetch('/api/spreadsheet', {
+      const res = await apiFetch('/api/spreadsheet', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updatedRows),
@@ -440,6 +530,8 @@ export default function App() {
       }
     } catch (err) {
       console.error(err);
+      showToast('Backend tidak tersedia, baris disimpan lokal', 'info');
+      triggerAutoSilentPush();
     }
   };
 
@@ -454,6 +546,7 @@ export default function App() {
       async () => {
         const updatedRows = rows.filter(r => r.id !== rowId);
         setRows(updatedRows);
+        saveLocalRowsFallback(updatedRows);
 
         // Remove from selections if selected
         if (selectedRowIds.has(rowId)) {
@@ -463,7 +556,7 @@ export default function App() {
         }
 
         try {
-          const res = await fetch('/api/spreadsheet', {
+          const res = await apiFetch('/api/spreadsheet', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(updatedRows),
@@ -477,6 +570,8 @@ export default function App() {
           }
         } catch (err) {
           console.error(err);
+          showToast('Backend tidak tersedia, perubahan disimpan lokal', 'info');
+          triggerAutoSilentPush();
         }
       },
       'Hapus',
@@ -643,7 +738,7 @@ export default function App() {
           await sleep(SAVE_SCREENSHOT_RETRY_DELAY_MS);
         }
 
-        const res = await fetch('/api/save-screenshot', {
+      const res = await apiFetch('/api/save-screenshot', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -762,7 +857,7 @@ export default function App() {
             await sleep(SAVE_SCREENSHOT_RETRY_DELAY_MS);
           }
 
-          const res = await fetch('/api/save-screenshot', {
+          const res = await apiFetch('/api/save-screenshot', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -897,7 +992,7 @@ export default function App() {
                 await sleep(SAVE_SCREENSHOT_RETRY_DELAY_MS);
               }
 
-              const res = await fetch('/api/save-screenshot', {
+              const res = await apiFetch('/api/save-screenshot', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -962,7 +1057,7 @@ export default function App() {
       `Apakah Anda yakin ingin menghapus file screenshot kategori "${category || '(Tanpa Kategori)'}" secara permanen dari penyimpanan awan server?`,
       async () => {
         try {
-          const res = await fetch(`/api/screenshots/${id}`, { method: 'DELETE' });
+          const res = await apiFetch(`/api/screenshots/${id}`, { method: 'DELETE' });
           if (res.ok) {
             showToast('Screenshot terhapus dari penyimpanan awan', 'success');
             fetchScreenshots();
@@ -990,7 +1085,7 @@ export default function App() {
       `Apakah Anda yakin ingin menghapus SEMUA (${countOnDate}) screenshot pada tanggal "${dateKey}" secara permanen dari penyimpanan awan server?`,
       async () => {
         try {
-          const res = await fetch('/api/screenshots/bulk-delete', {
+          const res = await apiFetch('/api/screenshots/bulk-delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ dateKey }),
