@@ -1,0 +1,6 @@
+{
+  "name": "Screenshot Spreadsheet Dashboard",
+  "description": "Dashboard untuk mengambil screenshot URL website, mengonfigurasi kredensial login, dan mengelola link menggunakan basis data Spreadsheet visual.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
