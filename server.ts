@@ -1,6 +1,7 @@
 import express from "express";
-import path from "path";
-import fs from "fs";
+import * as path from "node:path";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import { INITIAL_SPREADSHEET_DATA } from "./src/data";
 import { SpreadsheetRow, ScreenshotFile } from "./src/types";
 
@@ -11,7 +12,7 @@ const IS_VERCEL = Boolean(process.env.VERCEL);
 // Vercel serverless: hanya /tmp yang bisa ditulis. Di lokal tetap pakai ./data
 function getDataDir() {
   return IS_VERCEL
-    ? path.join("/tmp", "screenshot-dashboard-data")
+    ? path.join(os.tmpdir(), "screenshot-dashboard-data")
     : path.join(process.cwd(), "data");
 }
 
@@ -38,15 +39,8 @@ const PLAYWRIGHT_COOLDOWN_MS = Number(process.env.PLAYWRIGHT_COOLDOWN_MS || 4000
 const PLAYWRIGHT_EXTRA_STABLE_WAIT_MS = Number(process.env.PLAYWRIGHT_EXTRA_STABLE_WAIT_MS || 2500);
 
 async function captureRealScreenshotWithPlaywright(targetUrl: string): Promise<Buffer> {
-  if (IS_VERCEL) {
-    throw new Error("Playwright tidak didukung di Vercel serverless");
-  }
-  const mod = await import("./src/playwrightCapture");
-  return mod.captureRealScreenshotWithPlaywright(targetUrl, {
-    timeoutMs: PLAYWRIGHT_TIMEOUT_MS,
-    extraStableWaitMs: PLAYWRIGHT_EXTRA_STABLE_WAIT_MS,
-    minBytes: MIN_REAL_SCREENSHOT_BYTES,
-  });
+  // Playwright sengaja tidak di-bundle ke Vercel (terlalu berat). Lokal pakai localDev.ts.
+  throw new Error("Playwright tidak tersedia di runtime ini");
 }
 
 // Middleware to parse incoming bodies with increased size limit for base64 screenshots
@@ -58,12 +52,24 @@ const DATA_DIR = getDataDir();
 const SCREENSHOTS_DIR = path.join(DATA_DIR, "screenshots");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
+let DISK_STORAGE_OK = true;
+let DISK_STORAGE_ERR = "";
+
 function ensureDataDirs() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(SCREENSHOTS_DIR)) {
-    fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+  if (!DISK_STORAGE_OK) return;
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(SCREENSHOTS_DIR)) {
+      fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+    }
+  } catch (e: any) {
+    // Jika runtime tidak mengizinkan filesystem (atau /tmp tidak bisa ditulis),
+    // jangan bikin semua endpoint 500. Kita fallback ke penyimpanan memori.
+    DISK_STORAGE_OK = false;
+    DISK_STORAGE_ERR = e?.message || String(e);
+    console.error("[Storage] Filesystem tidak tersedia, fallback ke memori:", DISK_STORAGE_ERR);
   }
 }
 
@@ -82,15 +88,32 @@ async function persistScreenshotFile(
     return { imageUrl: blob.url, filename };
   }
 
-  ensureDataDirs();
-  const filepath = path.join(SCREENSHOTS_DIR, filename);
-  fs.writeFileSync(filepath, imageBuffer);
-  return { imageUrl: `/screenshots/${filename}`, filename };
+  // Fallback 1: simpan ke disk (lokal atau /tmp)
+  if (DISK_STORAGE_OK) {
+    ensureDataDirs();
+    const filepath = path.join(SCREENSHOTS_DIR, filename);
+    fs.writeFileSync(filepath, imageBuffer);
+    // Di Vercel, lebih aman expose lewat endpoint API (bukan rewrite /screenshots)
+    // karena konfigurasi static route bisa berbeda-beda.
+    return {
+      imageUrl: IS_VERCEL ? `/api/screenshot-file/${encodeURIComponent(filename)}` : `/screenshots/${filename}`,
+      filename,
+    };
+  }
+
+  // Fallback 2: jika disk tidak tersedia, kirim sebagai data URL agar UI tetap bisa tampil.
+  // Catatan: Ini tidak persisten; untuk produksi disarankan aktifkan Vercel Blob Storage.
+  const dataUrl = `data:image/png;base64,${imageBuffer.toString("base64")}`;
+  return { imageUrl: dataUrl, filename };
 }
 
 // Ensure database file exists
 function loadDatabase(): { spreadsheet: SpreadsheetRow[]; screenshots: ScreenshotFile[] } {
   ensureDataDirs();
+  if (!DISK_STORAGE_OK) {
+    // Tanpa disk: jalankan dengan default data (non-persisten) supaya API tidak 500.
+    return { spreadsheet: INITIAL_SPREADSHEET_DATA, screenshots: [] };
+  }
   try {
     if (fs.existsSync(DB_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
@@ -104,17 +127,48 @@ function loadDatabase(): { spreadsheet: SpreadsheetRow[]; screenshots: Screensho
   }
 
   const defaultDb = { spreadsheet: INITIAL_SPREADSHEET_DATA, screenshots: [] };
-  fs.writeFileSync(DB_FILE, JSON.stringify(defaultDb, null, 2), "utf-8");
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(defaultDb, null, 2), "utf-8");
+  } catch (e: any) {
+    DISK_STORAGE_OK = false;
+    DISK_STORAGE_ERR = e?.message || String(e);
+    console.error("[Storage] Gagal menulis DB, fallback ke memori:", DISK_STORAGE_ERR);
+  }
   return defaultDb;
 }
 
 function saveDatabase(data: { spreadsheet: SpreadsheetRow[]; screenshots: ScreenshotFile[] }) {
   ensureDataDirs();
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+  if (!DISK_STORAGE_OK) return;
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+  } catch (e: any) {
+    DISK_STORAGE_OK = false;
+    DISK_STORAGE_ERR = e?.message || String(e);
+    console.error("[Storage] Gagal menyimpan DB, fallback ke memori:", DISK_STORAGE_ERR);
+  }
 }
 
 // Serve Screenshots Directory statically
 app.use("/screenshots", express.static(SCREENSHOTS_DIR));
+
+// Serve single screenshot file via API (utama untuk Vercel ketika storage menggunakan /tmp)
+app.get("/api/screenshot-file/:filename", (req, res) => {
+  try {
+    if (!DISK_STORAGE_OK) return res.status(404).send("Storage tidak tersedia");
+    const filename = String(req.params.filename || "");
+    if (!filename || filename.includes("..") || filename.includes("/") || filename.includes("\\")) {
+      return res.status(400).send("Nama file tidak valid");
+    }
+    const filepath = path.join(SCREENSHOTS_DIR, filename);
+    if (!fs.existsSync(filepath)) return res.status(404).send("File tidak ditemukan");
+    const buf = fs.readFileSync(filepath);
+    res.setHeader("Content-Type", "image/png");
+    res.send(buf);
+  } catch (e: any) {
+    res.status(500).send(e?.message || "Gagal membaca file");
+  }
+});
 
 // -----------------------------------------------------------------------------
 // API ENDPOINTS
@@ -126,8 +180,14 @@ app.get("/api/health", (req, res) => {
     status: "ok",
     mode: process.env.NODE_ENV || "development",
     platform: IS_VERCEL ? "vercel" : "node",
-    storage: process.env.BLOB_READ_WRITE_TOKEN ? "vercel-blob" : IS_VERCEL ? "tmp" : "local-disk",
+    storage: process.env.BLOB_READ_WRITE_TOKEN
+      ? "vercel-blob"
+      : IS_VERCEL
+        ? (DISK_STORAGE_OK ? "tmp" : "memory")
+        : "local-disk",
     dataDir: DATA_DIR,
+    diskStorageOk: DISK_STORAGE_OK,
+    diskStorageErr: DISK_STORAGE_ERR || undefined,
   });
 });
 

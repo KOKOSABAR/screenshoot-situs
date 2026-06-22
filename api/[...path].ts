@@ -1,9 +1,10 @@
 import { app } from "../server";
 
+// Catch-all agar semua route `/api/*` masuk ke Express app tanpa perlu rewrite khusus.
 export default app;
 
 export const config = {
-  // Pastikan function berjalan di Node.js runtime (Express + fs butuh Node runtime).
   runtime: "nodejs20.x",
   maxDuration: 60,
 };
+
